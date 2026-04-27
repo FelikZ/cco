@@ -7,8 +7,8 @@ class Cco < Formula
     # Install the entire repository contents to libexec
     libexec.install Dir["*"]
 
-    # Symlink the main executable into bin
-    bin.install_symlink libexec/"cco"
+    # Create a wrapper in bin that points to libexec
+    bin.write_exec_script libexec/"cco"
   end
 
   test do
