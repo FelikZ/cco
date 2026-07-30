@@ -140,6 +140,19 @@ for backend in native docker; do
 			"docker mounts trusted git common dir without remap"
 	fi
 
+	run_backend_case "$backend" "parent-launched worktree" "$TEST_ROOT" "$TEST_HOME" "$TEST_ROOT/parent_${backend}.log"
+	assert_contains "$TEST_ROOT/parent_${backend}.log" \
+		"Adding git common dir for worktree support: $MAIN_GIT_DIR" \
+		"parent launch adds main git dir for nested worktree ($backend)"
+	assert_not_contains "$TEST_ROOT/parent_${backend}.log" \
+		"Skipping untrusted git common dir layout" \
+		"parent launch keeps trusted worktree layout ($backend)"
+	if [[ "$backend" == "docker" ]]; then
+		assert_contains "$TEST_ROOT/parent_${backend}.log" \
+			"Mounting additional directory: $MAIN_GIT_DIR" \
+			"docker mounts nested worktree git common dir from parent launch"
+	fi
+
 	run_backend_case "$backend" "trusted worktree with auto-detect disabled" "$WORKTREE_DIR" "$TEST_HOME" "$TEST_ROOT/disabled_${backend}.log" \
 		--disable-git-worktree-common-dir
 	assert_contains "$TEST_ROOT/disabled_${backend}.log" \

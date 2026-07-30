@@ -89,7 +89,12 @@ apply_codex_arg_policies() {
 		return
 	fi
 
-	if ! codex_args_contain_any "${claude_args[@]}" -- "--dangerously-bypass-approvals-and-sandbox"; then
+	if [[ "${auto_mode:-}" == true ]]; then
+		if ! codex_args_contain_any "${claude_args[@]}" -- "--ask-for-approval" "-a"; then
+			claude_args=("--ask-for-approval" "on-request" "${claude_args[@]}")
+			log "Added Codex auto-mode flag '--ask-for-approval on-request'"
+		fi
+	elif ! codex_args_contain_any "${claude_args[@]}" -- "--dangerously-bypass-approvals-and-sandbox"; then
 		claude_args=("--dangerously-bypass-approvals-and-sandbox" "${claude_args[@]}")
 		log "Added Codex bypass flag '--dangerously-bypass-approvals-and-sandbox'"
 	fi
@@ -178,6 +183,13 @@ while [[ $# -gt 0 ]]; do
 	--sandbox=*)
 		shift
 		;;
+	-a | --ask-for-approval)
+		shift
+		[[ $# -gt 0 ]] && shift
+		;;
+	--ask-for-approval=*)
+		shift
+		;;
 	-c | --config)
 		if [[ $# -gt 1 && "$2" == sandbox_mode=* ]]; then
 			shift 2
@@ -198,8 +210,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 cmd=("$real_codex")
-if [[ "$saw_bypass" != true && "$requests_help_or_version" != true ]]; then
-	cmd+=("--dangerously-bypass-approvals-and-sandbox")
+if [[ "$requests_help_or_version" != true ]]; then
+	if [[ "${CCO_CODEX_AUTO_MODE:-}" == true ]]; then
+		cmd+=("--ask-for-approval" "on-request" "--sandbox" "danger-full-access")
+	elif [[ "$saw_bypass" != true ]]; then
+		cmd+=("--dangerously-bypass-approvals-and-sandbox")
+	fi
 fi
 cmd+=("${filtered_args[@]}")
 exec "${cmd[@]}"

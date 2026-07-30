@@ -69,7 +69,7 @@ is_valid_persist_name() {
 
 is_known_subcommand() {
 	case "$1" in
-	shell | codex | droid | opencode | pi | gemini | self-update | cleanup | info | backup-creds | restore-creds | pull | rebuild)
+	shell | auto | codex | droid | opencode | pi | gemini | self-update | cleanup | info | backup-creds | restore-creds | pull | rebuild)
 		return 0
 		;;
 	*)
@@ -145,15 +145,34 @@ persist_scope_slug_for_root() {
 	fi
 }
 
+probe_linux_bwrap() {
+	bwrap --ro-bind / / true
+}
+
+explain_linux_bwrap_failure() {
+	local probe_output="$1"
+	warn "Native Linux sandbox is unavailable: bubblewrap is installed but cannot start."
+	if [[ "$probe_output" == *"setting up uid map"* && "$probe_output" == *"Permission denied"* ]]; then
+		warn "bubblewrap could not set up its uid_map; AppArmor/user-namespace policy is preventing setup."
+	elif [[ -n "$probe_output" ]]; then
+		local first_line="${probe_output%%$'\n'*}"
+		warn "bubblewrap probe failed: $first_line"
+	fi
+}
+
 # Detect available sandbox backends
 detect_sandbox_backend() {
 	local force_backend="$1"
+	local forced_native=false
 
 	if [[ -n "$force_backend" ]]; then
 		case "$force_backend" in
-		native | docker)
-			SANDBOX_BACKEND="$force_backend"
+		docker)
+			SANDBOX_BACKEND="docker"
 			return
+			;;
+		native)
+			forced_native=true
 			;;
 		auto | "")
 			# Continue with auto-detection
@@ -175,6 +194,9 @@ detect_sandbox_backend() {
 		if command -v sandbox-exec &>/dev/null; then
 			SANDBOX_BACKEND="native"
 			log "Using native sandbox (Seatbelt)"
+		elif [[ "$forced_native" == true ]]; then
+			error "Native sandbox was requested with --backend native, but sandbox-exec is not available."
+			exit 1
 		elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
 			SANDBOX_BACKEND="docker"
 			log "Using Docker sandbox (Seatbelt not available)"
@@ -185,12 +207,35 @@ detect_sandbox_backend() {
 	elif [[ "$os" == "Linux" ]]; then
 		# Linux: Check for bubblewrap
 		if command -v bwrap &>/dev/null; then
-			SANDBOX_BACKEND="native"
-			log "Using native sandbox (bubblewrap)"
+			local bwrap_probe_output
+			if bwrap_probe_output=$(probe_linux_bwrap 2>&1); then
+				SANDBOX_BACKEND="native"
+				log "Using native sandbox (bubblewrap)"
+			else
+				explain_linux_bwrap_failure "$bwrap_probe_output"
+				if [[ "$forced_native" == true ]]; then
+					error "Native sandbox was requested with --backend native, so cco cannot fall back automatically."
+					exit 1
+				elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+					SANDBOX_BACKEND="docker"
+					log "Using Docker sandbox (bubblewrap blocked by host policy)"
+				else
+					error "No sandbox backend available. Install Docker or fix the host bubblewrap/AppArmor policy."
+					exit 1
+				fi
+			fi
 		elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+			if [[ "$forced_native" == true ]]; then
+				error "Native sandbox was requested with --backend native, but bubblewrap is not installed."
+				exit 1
+			fi
 			SANDBOX_BACKEND="docker"
 			log "Using Docker sandbox (bubblewrap not available)"
 		else
+			if [[ "$forced_native" == true ]]; then
+				error "Native sandbox was requested with --backend native, but bubblewrap is not installed."
+				exit 1
+			fi
 			error "No sandbox backend available. Install bubblewrap or Docker."
 			exit 1
 		fi
@@ -221,6 +266,302 @@ get_command() {
 	else
 		get_claude_command
 	fi
+}
+
+claude_args_include_permission_mode() {
+	local arg
+
+	if ! declare -p claude_args >/dev/null 2>&1; then
+		return 1
+	fi
+
+	if ((${#claude_args[@]} == 0)); then
+		return 1
+	fi
+
+	for arg in "${claude_args[@]}"; do
+		case "$arg" in
+		--permission-mode | --permission-mode=* | --dangerously-skip-permissions | --allow-dangerously-skip-permissions)
+			return 0
+			;;
+		esac
+	done
+
+	return 1
+}
+
+# bjq is a bashy hack for the tiny bit of jq we need here: simple dot keys
+# plus numeric array indexes. It is intentionally not a jq clone.
+bjq_query_to_path_json() {
+	local raw="$1"
+	local path_json="["
+	local separator=""
+
+	if [[ "$raw" == .* ]]; then
+		raw="${raw#.}"
+	fi
+
+	if [[ -z "$raw" ]]; then
+		return 1
+	fi
+
+	while [[ -n "$raw" ]]; do
+		if [[ "$raw" =~ ^([A-Za-z_][A-Za-z0-9_-]*)(.*)$ ]]; then
+			path_json+="${separator}\"${BASH_REMATCH[1]}\""
+			separator=","
+			raw="${BASH_REMATCH[2]}"
+		elif [[ "$raw" =~ ^\[([0-9]+)\](.*)$ ]]; then
+			path_json+="${separator}${BASH_REMATCH[1]}"
+			separator=","
+			raw="${BASH_REMATCH[2]}"
+		else
+			return 1
+		fi
+
+		if [[ "$raw" == .* ]]; then
+			raw="${raw#.}"
+			if [[ -z "$raw" || "$raw" == .* ]]; then
+				return 1
+			fi
+		fi
+	done
+
+	path_json+="]"
+	printf '%s\n' "$path_json"
+}
+
+bjq() {
+	local query="$1"
+	local json_file="${2:-}"
+	local temp_json_file=""
+	local output_mode="${BJQ_OUTPUT:-value}"
+	local path_json
+
+	path_json=$(bjq_query_to_path_json "$query") || return 2
+
+	if [[ -n "$json_file" && ! -f "$json_file" ]]; then
+		return 1
+	fi
+
+	if command -v jq >/dev/null 2>&1; then
+		if [[ -z "$json_file" ]]; then
+			temp_json_file=$(mktemp)
+			cat >"$temp_json_file"
+			json_file="$temp_json_file"
+		fi
+
+		if ! jq . "$json_file" >/dev/null 2>&1; then
+			[[ -n "$temp_json_file" ]] && rm -f "$temp_json_file"
+			return 2
+		fi
+
+		local jq_program
+		if [[ "$output_mode" == "type" ]]; then
+			# shellcheck disable=SC2016
+			jq_program='
+				def path_lookup($p):
+					reduce $p[] as $part ({ok: true, v: .};
+						if (.ok | not) then .
+						elif ($part | type) == "number" then
+							if ((.v | type) == "array") and ($part >= 0) and ($part < (.v | length)) then {ok: true, v: .v[$part]} else {ok: false, v: null} end
+						else
+							if ((.v | type) == "object") and (.v | has($part)) then {ok: true, v: .v[$part]} else {ok: false, v: null} end
+						end);
+				path_lookup($path) as $result
+				| if $result.ok then $result.v else empty end
+				| type
+			'
+		else
+			# shellcheck disable=SC2016
+			jq_program='
+				def path_lookup($p):
+					reduce $p[] as $part ({ok: true, v: .};
+						if (.ok | not) then .
+						elif ($part | type) == "number" then
+							if ((.v | type) == "array") and ($part >= 0) and ($part < (.v | length)) then {ok: true, v: .v[$part]} else {ok: false, v: null} end
+						else
+							if ((.v | type) == "object") and (.v | has($part)) then {ok: true, v: .v[$part]} else {ok: false, v: null} end
+						end);
+				path_lookup($path) as $result
+				| if $result.ok then $result.v else empty end
+				| if type == "string" then .
+				  elif type == "boolean" or type == "number" or type == "null" then tostring
+				  else tojson
+				  end
+			'
+		fi
+
+		if [[ -n "$json_file" ]]; then
+			jq -er --argjson path "$path_json" "$jq_program" "$json_file"
+		else
+			jq -er --argjson path "$path_json" "$jq_program"
+		fi
+		local status=$?
+		[[ -n "$temp_json_file" ]] && rm -f "$temp_json_file"
+		[[ $status -eq 4 ]] && return 1
+		return "$status"
+	fi
+
+	if ! command -v python3 >/dev/null 2>&1; then
+		return 127
+	fi
+
+	if [[ -z "$json_file" ]]; then
+		temp_json_file=$(mktemp)
+		cat >"$temp_json_file"
+		json_file="$temp_json_file"
+	fi
+
+	python3 - "$path_json" "$json_file" "$output_mode" <<'PY'
+import json
+import sys
+
+path = json.loads(sys.argv[1])
+json_file = sys.argv[2]
+output_mode = sys.argv[3]
+
+try:
+    with open(json_file, "r", encoding="utf-8") as handle:
+        value = json.load(handle)
+except Exception:
+    sys.exit(2)
+
+try:
+    for part in path:
+        if isinstance(part, int):
+            if not isinstance(value, list) or part >= len(value):
+                sys.exit(1)
+            value = value[part]
+        else:
+            if not isinstance(value, dict) or part not in value:
+                sys.exit(1)
+            value = value[part]
+except Exception:
+    sys.exit(1)
+
+if output_mode == "type":
+    if isinstance(value, str):
+        print("string")
+    elif value is True or value is False:
+        print("boolean")
+    elif value is None:
+        print("null")
+    elif isinstance(value, (int, float)):
+        print("number")
+    elif isinstance(value, list):
+        print("array")
+    elif isinstance(value, dict):
+        print("object")
+    else:
+        sys.exit(1)
+elif isinstance(value, str):
+    print(value)
+elif value is True:
+    print("true")
+elif value is False:
+    print("false")
+elif value is None:
+    print("null")
+elif isinstance(value, (int, float)):
+    print(value)
+else:
+    print(json.dumps(value, separators=(",", ":")))
+PY
+	local status=$?
+	[[ -n "$temp_json_file" ]] && rm -f "$temp_json_file"
+	return "$status"
+}
+
+bjq_type() {
+	local BJQ_OUTPUT=type
+	bjq "$@"
+}
+
+read_claude_permission_setting() {
+	local settings_file="$1"
+	local setting_name="$2"
+
+	if [[ ! -f "$settings_file" ]]; then
+		return 1
+	fi
+
+	bjq "permissions.$setting_name" "$settings_file" 2>/dev/null
+}
+
+trusted_claude_settings_paths() {
+	printf '%s\n' "$PWD/.claude/settings.local.json"
+	printf '%s\n' "$(find_claude_config_dir)/settings.json"
+}
+
+claude_managed_settings_path() {
+	case "$(uname -s)" in
+	Darwin)
+		printf '%s\n' "/Library/Application Support/ClaudeCode/managed-settings.json"
+		;;
+	Linux)
+		printf '%s\n' "/etc/claude-code/managed-settings.json"
+		;;
+	esac
+}
+
+claude_external_auth_settings_paths() {
+	local user_settings
+	user_settings="$(find_claude_config_dir)/settings.json"
+
+	# Docker sessions only mount user/project settings into the container, so
+	# managed host settings cannot be trusted to satisfy auth inside Docker.
+	if [[ "$SANDBOX_BACKEND" != "docker" ]]; then
+		claude_managed_settings_path || true
+	fi
+	printf '%s\n' "$PWD/.claude/settings.local.json"
+	printf '%s\n' "$PWD/.claude/settings.json"
+	printf '%s\n' "$user_settings"
+}
+
+claude_auto_mode_disabled() {
+	local settings_file value
+
+	while IFS= read -r settings_file; do
+		value=$(read_claude_permission_setting "$settings_file" "disableAutoMode" || true)
+		if [[ "$value" == "disable" ]]; then
+			return 0
+		fi
+	done < <(trusted_claude_settings_paths)
+
+	return 1
+}
+
+claude_default_permission_mode() {
+	local settings_file value
+
+	while IFS= read -r settings_file; do
+		value=$(read_claude_permission_setting "$settings_file" "defaultMode" || true)
+		if [[ -n "$value" ]]; then
+			printf '%s\n' "$value"
+			return 0
+		fi
+	done < <(trusted_claude_settings_paths)
+
+	return 1
+}
+
+build_claude_permission_args() {
+	claude_permission_args=()
+
+	if claude_args_include_permission_mode; then
+		return
+	fi
+
+	if [[ "${auto_mode:-}" == true ]]; then
+		claude_permission_args=("--permission-mode" "auto")
+		return
+	fi
+
+	if ! claude_auto_mode_disabled && [[ "$(claude_default_permission_mode || true)" == "auto" ]]; then
+		return
+	fi
+
+	claude_permission_args=("--dangerously-skip-permissions")
 }
 
 # Load agent-specific behavior/policies from dedicated modules.
@@ -373,84 +714,92 @@ handle_add_dir_entry() {
 	esac
 }
 
-# Parse additionalDirectories from .claude/settings.local.json
-# Prefer python3 for portability and fall back to jq when available.
+load_project_env_file_into_environment() {
+	if [[ ! -f ".env" ]]; then
+		return
+	fi
+
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		# Match Docker-style comment handling by ignoring leading whitespace.
+		local trimmed_line="${line#"${line%%[![:space:]]*}"}"
+		[[ -z "$trimmed_line" || "$trimmed_line" == \#* ]] && continue
+		[[ "$trimmed_line" != *"="* ]] && continue
+		local env_key="${line%%=*}"
+		local env_val="${line#*=}"
+		export "${env_key}=${env_val}"
+	done <".env"
+}
+
+apply_custom_env_vars_to_environment() {
+	local custom_env env_key env_val
+
+	if ! declare -p custom_env_vars >/dev/null 2>&1; then
+		return
+	fi
+
+	if ((${#custom_env_vars[@]} == 0)); then
+		return
+	fi
+
+	for custom_env in "${custom_env_vars[@]}"; do
+		if [[ "$custom_env" == *"="* ]]; then
+			env_key="${custom_env%%=*}"
+			env_val="${custom_env#*=}"
+			export "${env_key}=${env_val}"
+		else
+			# KEY-only format: pass through from host environment
+			if [[ -n "${!custom_env}" ]]; then
+				export "${custom_env}=${!custom_env}"
+			fi
+		fi
+	done
+}
+
+apply_preflight_environment() {
+	load_project_env_file_into_environment
+	apply_custom_env_vars_to_environment
+}
+
+# Parse additionalDirectories from .claude/settings.local.json.
 load_additional_directories_from_settings() {
 	local settings_file="$PWD/.claude/settings.local.json"
 	if [[ ! -f "$settings_file" ]]; then
 		return
 	fi
 
-	local parser=""
-	if command -v python3 &>/dev/null; then
-		parser="python3"
-	elif command -v jq &>/dev/null; then
-		parser="jq"
+	local dirs_type parse_status
+	if dirs_type=$(bjq_type "additionalDirectories" "$settings_file" 2>/dev/null); then
+		parse_status=0
 	else
-		warn "python3/jq not found; skipping additionalDirectories from $settings_file"
+		parse_status=$?
+		if [[ $parse_status -eq 127 ]]; then
+			warn "python3/jq not found; skipping additionalDirectories from $settings_file"
+		elif [[ $parse_status -ne 1 ]]; then
+			warn "Skipping additionalDirectories from $settings_file: Unable to parse settings.local.json"
+		fi
 		return
 	fi
 
-	local dirs parse_output parse_error parse_status
-	if [[ "$parser" == "python3" ]]; then
-		if parse_output=$(
-			python3 - "$settings_file" 2>&1 <<'PY'
-import json
-import sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        data = json.load(handle)
-except Exception as exc:
-    print(f"Unable to parse settings.local.json: {exc}", file=sys.stderr)
-    sys.exit(1)
-
-directories = data.get("additionalDirectories", [])
-if directories is None:
-    sys.exit(0)
-if not isinstance(directories, list):
-    print("Unable to parse settings.local.json: additionalDirectories must be an array", file=sys.stderr)
-    sys.exit(1)
-
-for entry in directories:
-    if isinstance(entry, str):
-        print(entry)
-PY
-		); then
-			parse_status=0
-		else
-			parse_status=$?
-		fi
-	else
-		if parse_output=$(jq -r '
-			(.additionalDirectories // []) as $dirs
-			| if ($dirs | type) != "array" then
-				error("Unable to parse settings.local.json: additionalDirectories must be an array")
-			  else
-				$dirs[]
-			  end
-			| select(type == "string")
-		' "$settings_file" 2>&1); then
-			parse_status=0
-		else
-			parse_status=$?
-		fi
-	fi
-
-	if [[ $parse_status -ne 0 ]]; then
-		parse_error=$(printf '%s' "$parse_output" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
-		if [[ -z "$parse_error" ]]; then
-			parse_error="Unable to parse settings.local.json"
-		fi
-		warn "Skipping additionalDirectories from $settings_file: $parse_error"
+	if [[ "$dirs_type" == "null" ]]; then
 		return
 	fi
 
-	dirs="$parse_output"
+	if [[ "$dirs_type" != "array" ]]; then
+		warn "Skipping additionalDirectories from $settings_file: Unable to parse settings.local.json: additionalDirectories must be an array"
+		return
+	fi
 
-	local dir
-	while IFS= read -r dir; do
+	local dir dir_type index=0
+	while dir_type=$(bjq_type "additionalDirectories[$index]" "$settings_file" 2>/dev/null); do
+		if [[ "$dir_type" != "string" ]]; then
+			index=$((index + 1))
+			continue
+		fi
+
+		dir=$(bjq "additionalDirectories[$index]" "$settings_file" 2>/dev/null || true)
+		index=$((index + 1))
 		[[ -z "$dir" ]] && continue
+
 		local resolved
 		resolved=$(resolve_path "$dir")
 		if [[ -n "$resolved" && -d "$resolved" ]]; then
@@ -461,7 +810,7 @@ PY
 		else
 			warn "Skipping additionalDirectories entry (not a directory): $dir"
 		fi
-	done <<<"$dirs"
+	done
 }
 
 # Check if Docker is available (only when using Docker backend)
@@ -520,6 +869,51 @@ find_claude_config_dir() {
 
 	# Return primary location for error reporting
 	echo "$primary_dir"
+}
+
+read_claude_settings_string_if_present() {
+	local settings_file="$1"
+	local query="$2"
+	local value value_type
+	if [[ ! -f "$settings_file" ]]; then
+		return 1
+	fi
+
+	value_type=$(bjq_type "$query" "$settings_file" 2>/dev/null || true)
+	if [[ "$value_type" != "string" ]]; then
+		return 1
+	fi
+
+	value=$(bjq "$query" "$settings_file" 2>/dev/null || true)
+	printf '%s\n' "$value"
+}
+
+claude_settings_has_external_auth() {
+	local settings_file query value
+	local auth_queries=(
+		"apiKeyHelper"
+		"env.ANTHROPIC_API_KEY"
+		"env.ANTHROPIC_AUTH_TOKEN"
+		"env.CLAUDE_CODE_OAUTH_TOKEN"
+	)
+
+	for query in "${auth_queries[@]}"; do
+		while IFS= read -r settings_file; do
+			if value=$(read_claude_settings_string_if_present "$settings_file" "$query"); then
+				[[ "$value" =~ [^[:space:]] ]] && return 0
+				break
+			fi
+		done < <(claude_external_auth_settings_paths)
+	done
+
+	return 1
+}
+
+using_external_claude_auth() {
+	[[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ||
+		-n "${ANTHROPIC_API_KEY:-}" ||
+		-n "${ANTHROPIC_AUTH_TOKEN:-}" ]] ||
+		claude_settings_has_external_auth
 }
 
 get_claude_keychain_account() {
@@ -643,70 +1037,27 @@ get_claude_credentials_payload() {
 
 extract_oauth_expiry_ms() {
 	local credentials_payload="$1"
-	local expires_at="" parse_status=0
+	local expires_at="" query value value_type
 
 	# Prefer the Claude OAuth expiry field, but tolerate the older flat payload shape.
-	if command -v python3 &>/dev/null; then
-		if expires_at=$(
-			python3 - "$credentials_payload" 2>/dev/null <<'PY'
-import json
-import sys
-
-try:
-    data = json.loads(sys.argv[1])
-except Exception:
-    sys.exit(1)
-
-candidates = []
-claude_oauth = data.get("claudeAiOauth")
-if isinstance(claude_oauth, dict):
-    candidates.append(claude_oauth.get("expiresAt"))
-candidates.append(data.get("expiresAt"))
-
-for value in candidates:
-    if isinstance(value, bool):
-        continue
-    if isinstance(value, int):
-        print(value)
-        sys.exit(0)
-    if isinstance(value, float) and value.is_integer():
-        print(int(value))
-        sys.exit(0)
-    if isinstance(value, str) and value.isdigit():
-        print(value)
-        sys.exit(0)
-
-sys.exit(1)
-PY
-		); then
-			parse_status=0
-		else
-			parse_status=$?
+	for query in "claudeAiOauth.expiresAt" "expiresAt"; do
+		value_type=$(printf '%s' "$credentials_payload" | bjq_type "$query" 2>/dev/null || true)
+		if [[ "$value_type" != "number" && "$value_type" != "string" ]]; then
+			continue
 		fi
-	elif command -v jq &>/dev/null; then
-		if expires_at=$(printf '%s' "$credentials_payload" | jq -r '
-			[
-				.claudeAiOauth.expiresAt?,
-				.expiresAt?
-			]
-			| map(
-				if type == "number" then tostring
-				elif type == "string" and test("^[0-9]+$") then .
-				else null
-				end
-			)
-			| map(select(. != null))
-			| .[0] // empty
-		' 2>/dev/null); then
-			parse_status=0
-		else
-			parse_status=$?
-		fi
-	else
-		return 1
-	fi
 
-	if [[ $parse_status -ne 0 || -z "$expires_at" || ! "$expires_at" =~ ^[0-9]+$ ]]; then
+		value=$(printf '%s' "$credentials_payload" | bjq "$query" 2>/dev/null || true)
+		if [[ "$value_type" == "number" && "$value" =~ ^[0-9]+([.]0+)?$ ]]; then
+			expires_at="${value%%.*}"
+			break
+		fi
+		if [[ "$value_type" == "string" && "$value" =~ ^[0-9]+$ ]]; then
+			expires_at="$value"
+			break
+		fi
+	done
+
+	if [[ -z "$expires_at" || ! "$expires_at" =~ ^[0-9]+$ ]]; then
 		return 1
 	fi
 
@@ -727,6 +1078,30 @@ oauth_token_needs_startup_refresh() {
 	((expires_at_ms <= now_ms + refresh_window_ms))
 }
 
+oauth_token_is_expired() {
+	local expires_at_ms="$1"
+	local now_ms
+	now_ms=$(($(date +%s) * 1000))
+
+	((expires_at_ms <= now_ms))
+}
+
+oauth_token_needs_background_refresh() {
+	local expires_at_ms="$1"
+	local now_ms refresh_window_ms
+	now_ms=$(($(date +%s) * 1000))
+	refresh_window_ms=$((2 * 60 * 60 * 1000))
+
+	((expires_at_ms <= now_ms + refresh_window_ms))
+}
+
+oauth_background_refresh_lock_dir() {
+	local marker_key marker_hash
+	marker_key="$(get_claude_config_dir):$SANDBOX_BACKEND"
+	marker_hash=$(sha256_prefix8 "$marker_key") || return 1
+	printf '%s/cco/oauth-refresh-%s.lock\n' "${XDG_CACHE_HOME:-$HOME/.cache}" "$marker_hash"
+}
+
 backend_can_persist_oauth_refresh() {
 	if command -v security &>/dev/null; then
 		if [[ "$SANDBOX_BACKEND" == "native" ]]; then
@@ -743,7 +1118,7 @@ backend_can_persist_oauth_refresh() {
 	fi
 
 	if [[ "$SANDBOX_BACKEND" == "native" ]]; then
-		return 0
+		return 1
 	fi
 
 	if [[ "$SANDBOX_BACKEND" == "docker" && "$allow_oauth_refresh" == true ]]; then
@@ -766,7 +1141,7 @@ run_unsandboxed_claude_refresh() {
 	read -ra claude_cmd <<<"$claude_cmd_str"
 	refresh_dir=$(mktemp -d)
 
-	log "Running a one-shot unsandboxed Claude call to refresh OAuth credentials..."
+	log "Refreshing Claude OAuth credentials before starting sandbox; this may take a moment..."
 	(
 		cd "$refresh_dir" || exit 1
 		"${claude_cmd[@]}" -p --output-format text --no-session-persistence "Reply with OK and nothing else."
@@ -775,6 +1150,23 @@ run_unsandboxed_claude_refresh() {
 
 	rm -rf "$refresh_dir"
 	return "$status"
+}
+
+start_background_claude_refresh() {
+	local lock_dir
+	lock_dir=$(oauth_background_refresh_lock_dir) || return 0
+	mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || return 0
+
+	if ! mkdir "$lock_dir" 2>/dev/null; then
+		log "Claude OAuth credential refresh is already running in the background"
+		return 0
+	fi
+
+	log "Refreshing Claude OAuth credentials in the background before they expire..."
+	(
+		trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+		run_unsandboxed_claude_refresh >/dev/null 2>&1 || true
+	) &
 }
 
 confirm_default_yes() {
@@ -913,6 +1305,11 @@ ensure_accessible_macos_keychain_credentials() {
 }
 
 ensure_refreshable_oauth_credentials() {
+	# Externally managed auth has no local OAuth credential to refresh.
+	if using_external_claude_auth; then
+		return 0
+	fi
+
 	local credentials_payload expires_at_ms
 	credentials_payload=$(get_claude_credentials_payload)
 
@@ -924,48 +1321,50 @@ ensure_refreshable_oauth_credentials() {
 		return 0
 	fi
 
-	if ! oauth_token_needs_startup_refresh "$expires_at_ms"; then
-		return 0
-	fi
-
 	if backend_can_persist_oauth_refresh; then
-		warn "Claude OAuth token is expired or near expiry, but this backend can persist a refresh"
+		if oauth_token_needs_startup_refresh "$expires_at_ms"; then
+			warn "Claude OAuth token is expired or near expiry, but this backend can persist a refresh"
+		fi
 		return 0
 	fi
 
-	warn "Claude OAuth token is expired or near expiry"
-	warn "This sandbox path cannot safely persist Claude's refresh back to the host credentials"
-
-	if confirm_default_yes \
-		"cco thinks Claude's OAuth token needs a refresh, and this sandbox cannot save the refreshed credentials back to your host. Run a one-shot plain Claude refresh now before starting cco?" \
-		"--yes enabled; refreshing Claude OAuth credentials before starting cco"; then
+	if oauth_token_is_expired "$expires_at_ms"; then
 		if ! run_unsandboxed_claude_refresh; then
-			error "Claude refresh did not complete successfully"
-			error "Run plain \`$(get_claude_command)\` once outside the sandbox, then retry cco."
+			error "Claude OAuth refresh did not complete"
+			error "Run plain \`$(get_claude_command)\` to re-authenticate, then retry cco."
 			exit 1
 		fi
 
 		credentials_payload=$(get_claude_credentials_payload)
-		if [[ -n "$credentials_payload" ]] && expires_at_ms=$(extract_oauth_expiry_ms "$credentials_payload"); then
-			if oauth_token_needs_startup_refresh "$expires_at_ms"; then
-				error "Claude credentials still look expired after the refresh attempt"
-				error "Run plain \`$(get_claude_command)\` outside the sandbox, finish any login flow, then retry cco."
-				exit 1
-			fi
+		if [[ -z "$credentials_payload" ]] || ! expires_at_ms=$(extract_oauth_expiry_ms "$credentials_payload"); then
+			error "Could not verify Claude OAuth credentials after the refresh attempt"
+			error "Run plain \`$(get_claude_command)\` to re-authenticate, then retry cco."
+			exit 1
+		fi
+
+		if oauth_token_is_expired "$expires_at_ms"; then
+			error "Claude OAuth credentials are still expired after the refresh attempt"
+			error "Run plain \`$(get_claude_command)\` to re-authenticate, then retry cco."
+			exit 1
 		fi
 
 		log "Claude OAuth credentials refreshed"
 		return 0
 	fi
 
-	error "Claude credentials need an out-of-sandbox refresh before this cco session can start"
-	error "Run plain \`$(get_claude_command)\` once outside the sandbox, then retry cco."
-	exit 1
+	if oauth_token_needs_background_refresh "$expires_at_ms"; then
+		start_background_claude_refresh
+	fi
 }
 
 # Verify Claude Code authentication is available
 verify_claude_authentication() {
 	log "Verifying Claude Code authentication..."
+
+	if using_external_claude_auth; then
+		log "Using externally managed Claude authentication"
+		return 0
+	fi
 
 	local claude_config_dir credentials_file
 	claude_config_dir=$(find_claude_config_dir)
@@ -1162,10 +1561,88 @@ pull_prebuilt_image() {
 		# Tag as local image name for consistency
 		docker tag "$image_tag" "$IMAGE_NAME" >/dev/null 2>&1
 		log "Successfully pulled pre-built image"
+		offer_old_cco_image_cleanup "$image_tag"
 		return 0
 	else
 		warn "Failed to pull pre-built image, building locally..."
 		return 1
+	fi
+}
+
+list_old_cco_image_refs() {
+	local current_tag="$1"
+	local image_ref
+
+	while IFS= read -r image_ref; do
+		if [[ "$image_ref" == "$current_tag" || "$image_ref" == "ghcr.io/nikvdp/cco:<none>" ]]; then
+			continue
+		fi
+
+		case "$image_ref" in
+		ghcr.io/nikvdp/cco:*)
+			printf '%s\n' "$image_ref"
+			;;
+		esac
+	done < <(docker image ls ghcr.io/nikvdp/cco --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)
+}
+
+confirm_default_no() {
+	local prompt="$1"
+
+	if [[ -t 0 && -t 1 ]]; then
+		echo
+		read -p "$prompt [y/N] " -r
+		if [[ $REPLY =~ ^([Yy])$ ]]; then
+			return 0
+		fi
+	fi
+
+	return 1
+}
+
+remove_old_cco_images() {
+	local image_ref
+	local failed=false
+
+	for image_ref in "$@"; do
+		log "Removing old cco image tag: $image_ref"
+		if ! docker image rm "$image_ref" >/dev/null 2>&1; then
+			warn "Could not remove old cco image tag: $image_ref"
+			failed=true
+		fi
+	done
+
+	[[ "$failed" == false ]]
+}
+
+offer_old_cco_image_cleanup() {
+	local current_tag="$1"
+	local image_ref
+	local old_image_refs=()
+
+	while IFS= read -r image_ref; do
+		[[ -n "$image_ref" ]] && old_image_refs+=("$image_ref")
+	done < <(list_old_cco_image_refs "$current_tag")
+
+	if [[ ${#old_image_refs[@]} -eq 0 ]]; then
+		return 0
+	fi
+
+	warn "Found ${#old_image_refs[@]} old cco Docker image tag(s) from previous pulls"
+	for image_ref in "${old_image_refs[@]}"; do
+		warn "  $image_ref"
+	done
+
+	if [[ "$clean_old_images" == true ]]; then
+		remove_old_cco_images "${old_image_refs[@]}"
+		return
+	fi
+
+	if confirm_default_no "Remove these old cco Docker image tags now?"; then
+		remove_old_cco_images "${old_image_refs[@]}"
+	else
+		log "Keeping old cco Docker image tags"
+		log "Use --clean-old-images with pull or --pull to remove them automatically after a successful pull"
 	fi
 }
 
@@ -1576,39 +2053,16 @@ run_native_sandbox() {
 				cmd+=("${cmd_array[@]}" "${claude_args[@]}")
 			fi
 		else
-			# Running Claude - use --dangerously-skip-permissions since we're in a sandbox
-			if [[ ${#claude_args[@]} -eq 0 ]]; then
-				cmd+=("${cmd_array[@]}" "--dangerously-skip-permissions")
-			else
-				cmd+=("${cmd_array[@]}" "--dangerously-skip-permissions" "${claude_args[@]}")
-			fi
+			# Running Claude - use cco's default permission mode unless the user configured one.
+			build_claude_permission_args
+			cmd+=("${cmd_array[@]}" "${claude_permission_args[@]}" "${claude_args[@]}")
 		fi
 	fi
 
 	# Load .env file first (matching Docker backend behavior)
-	if [[ -f ".env" ]]; then
-		while IFS= read -r line || [[ -n "$line" ]]; do
-			# Skip empty lines and comments
-			[[ -z "$line" || "$line" == \#* ]] && continue
-			local env_key="${line%%=*}"
-			local env_val="${line#*=}"
-			export "${env_key}=${env_val}"
-		done <".env"
-	fi
-
+	load_project_env_file_into_environment
 	# Apply custom environment variables after .env so -e flags take precedence
-	for custom_env in "${custom_env_vars[@]}"; do
-		if [[ "$custom_env" == *"="* ]]; then
-			local env_key="${custom_env%%=*}"
-			local env_val="${custom_env#*=}"
-			export "${env_key}=${env_val}"
-		else
-			# KEY-only format: pass through from host environment
-			if [[ -n "${!custom_env}" ]]; then
-				export "${custom_env}=${!custom_env}"
-			fi
-		fi
-	done
+	apply_custom_env_vars_to_environment
 
 	# Execute in sandbox with full environment
 	exec "${cmd[@]}"
@@ -1824,6 +2278,7 @@ run_container() {
 		fi
 		add_mount_arg "$codex_shim_dir" "$codex_shim_dir" "ro"
 		docker_args+=(-e "CCO_PREPEND_PATH=$codex_shim_dir")
+		docker_args+=(-e "CCO_CODEX_AUTO_MODE=$auto_mode")
 		persistent_exec_path="$codex_shim_dir:$persistent_exec_path"
 		log "Enabled codex-mode PATH shim for nested codex invocations"
 	fi
@@ -1878,6 +2333,8 @@ run_container() {
 		# Anthropic / Claude Code
 		"ANTHROPIC_API_KEY"
 		"ANTHROPIC_BASE_URL"
+		"ANTHROPIC_AUTH_TOKEN"
+		"CLAUDE_CODE_OAUTH_TOKEN"
 		"CLAUDE_CONFIG_DIR"
 		# OpenAI / Codex
 		"OPENAI_API_KEY"
@@ -2350,7 +2807,8 @@ run_container() {
 			if [[ -n "$command_flag" || -n "$CCO_COMMAND" ]]; then
 				docker "${exec_args[@]}" "${cmd_array[@]}" "${claude_args[@]}"
 			else
-				docker "${exec_args[@]}" "${cmd_array[@]}" --dangerously-skip-permissions "${claude_args[@]}"
+				build_claude_permission_args
+				docker "${exec_args[@]}" "${cmd_array[@]}" "${claude_permission_args[@]}" "${claude_args[@]}"
 			fi
 		fi
 		local exec_status=$?
@@ -2425,11 +2883,12 @@ run_container() {
 					docker run "${docker_args[@]}" "$IMAGE_NAME" "${cmd_array[@]}" "${claude_args[@]}"
 				fi
 			else
-				# Running Claude - use --dangerously-skip-permissions
+				# Running Claude - use cco's default permission mode unless the user configured one.
+				build_claude_permission_args
 				if [[ -n "$tty_flag" ]]; then
-					docker run "$tty_flag" "${docker_args[@]}" "$IMAGE_NAME" "${cmd_array[@]}" --dangerously-skip-permissions "${claude_args[@]}"
+					docker run "$tty_flag" "${docker_args[@]}" "$IMAGE_NAME" "${cmd_array[@]}" "${claude_permission_args[@]}" "${claude_args[@]}"
 				else
-					docker run "${docker_args[@]}" "$IMAGE_NAME" "${cmd_array[@]}" --dangerously-skip-permissions "${claude_args[@]}"
+					docker run "${docker_args[@]}" "$IMAGE_NAME" "${cmd_array[@]}" "${claude_permission_args[@]}" "${claude_args[@]}"
 				fi
 			fi
 			run_status=$?
@@ -2588,6 +3047,7 @@ restore_credentials() {
 
 # Initialize variables
 claude_args=()
+claude_permission_args=()
 additional_dirs=()
 additional_ro_paths=()
 deny_paths=()
@@ -2601,6 +3061,7 @@ allow_keychain=false
 enable_background_tasks=false
 rebuild_image=false
 pull_image=false
+clean_old_images=false
 yes_flag=false
 shell_mode=false
 safe_mode=false
@@ -2614,6 +3075,7 @@ enable_git_worktree_common_dir=true
 claude_command_flag=""
 command_flag=""
 codex_mode=false
+auto_mode=false
 
 if [[ "${CCO_ALLOW_EXTERNAL_GIT_DIR:-}" == "1" ]]; then
 	allow_external_git_dir=true
@@ -2674,6 +3136,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--pull)
 		pull_image=true
+		shift
+		;;
+	--clean-old-images)
+		clean_old_images=true
 		shift
 		;;
 	--docker-socket)
@@ -2841,7 +3307,7 @@ while [[ $# -gt 0 ]]; do
 			while [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]]; do
 				# Stop if we hit a known subcommand
 				case "$1" in
-				shell | codex | droid | opencode | pi | gemini | self-update | cleanup | info | backup-creds | restore-creds | pull | rebuild)
+				shell | auto | codex | droid | opencode | pi | gemini | self-update | cleanup | info | backup-creds | restore-creds | pull | rebuild)
 					# This is a subcommand, not a directory
 					break
 					;;
@@ -2887,6 +3353,26 @@ if [[ $# -gt 0 ]]; then
 		shift
 		# All remaining arguments are shell command arguments
 		claude_args=("$@")
+		;;
+	auto)
+		# Auto mode: run the named agent in its CLI's "ask me when needed" mode instead of a full permission bypass.
+		auto_mode=true
+		shift # consume "auto"
+		case "${1:-claude}" in
+		claude)
+			[[ $# -gt 0 ]] && shift # drop the explicit "claude" agent name when present
+			claude_args=("$@")
+			;;
+		codex | droid | opencode | pi | gemini)
+			configure_agent_subcommand "$1"
+			shift
+			claude_args=("$@")
+			;;
+		*)
+			# No explicit/recognized agent: treat the rest as Claude args.
+			claude_args=("$@")
+			;;
+		esac
 		;;
 	codex)
 		# OpenAI Codex mode - set up the command and add default directory
@@ -2997,6 +3483,7 @@ if [[ $# -gt 0 ]]; then
 		echo "  opencode [args...]  Run OpenCode in sandbox"
 		echo "  pi [args...]        Run Pi coding agent in sandbox"
 		echo "  gemini [args...]    Run Google Gemini CLI in sandbox"
+		echo "  auto <agent> [args] Run an agent in auto mode (asks when needed, not full bypass)"
 		echo "  cleanup             Remove all cco containers"
 		echo "  info                Show system info and readiness"
 		echo "  pull                Pull latest pre-built image"
@@ -3007,6 +3494,7 @@ if [[ $# -gt 0 ]]; then
 		echo "Options:"
 		echo "  --rebuild             Force rebuild Docker image"
 		echo "  --pull                Pull latest image before starting"
+		echo "  --clean-old-images    Remove old cco image tags after a successful pull"
 		echo "  --yes, -y             Auto-accept startup recovery prompts"
 		echo "  --version, -v         Show version"
 		echo "  --env, -e KEY=VAL     Set container environment variable"
@@ -3051,6 +3539,8 @@ if [[ $# -gt 0 ]]; then
 		echo "                        Trust external git common dirs for worktree support"
 		echo "  CCO_SANDBOX_ARGS_FILE Persistent sandbox args file (one arg per line)"
 		echo "  ANTHROPIC_API_KEY     Passed through automatically"
+		echo "  ANTHROPIC_AUTH_TOKEN  Passed through automatically"
+		echo "  CLAUDE_CODE_OAUTH_TOKEN  Passed through (skips credential file check)"
 		echo "  OPENAI_API_KEY        Passed through automatically"
 		echo "  GEMINI_API_KEY        Passed through automatically"
 		echo "  FACTORY_API_KEY       Passed through automatically"
@@ -3104,6 +3594,7 @@ main() {
 
 	# Only verify Claude authentication if we need it
 	if needs_claude_authentication; then
+		apply_preflight_environment
 		verify_claude_authentication
 		ensure_refreshable_oauth_credentials
 	fi
@@ -3185,38 +3676,45 @@ main() {
 	# If inside a git worktree, the object store lives in the main repo's
 	# .git directory, not the worktree. Add it as an additional dir so both
 	# sandbox backends whitelist it for writes automatically.
+	# Also check immediate subdirectories, since cco may be launched from a
+	# parent folder that contains git worktree checkouts.
 	if [[ "$enable_git_worktree_common_dir" == true ]] && command -v git &>/dev/null; then
-		local git_common_dir_raw git_dir_raw git_common_dir git_dir
-		git_common_dir_raw="$(git rev-parse --git-common-dir 2>/dev/null)" || true
-		git_dir_raw="$(git rev-parse --git-dir 2>/dev/null)" || true
+		local _cco_check_dirs=("$PWD")
+		# Scan immediate subdirs for git repos/worktrees via direct .git glob
+		for _cco_gitdir in "$PWD"/*/.git; do
+			[[ -e "$_cco_gitdir" ]] || continue
+			_cco_check_dirs+=("${_cco_gitdir%/.git}")
+		done
 
-		if [[ -n "$git_common_dir_raw" && -n "$git_dir_raw" ]]; then
-			if git_common_dir="$(resolve_existing_dir "$git_common_dir_raw")"; then
-				if git_dir="$(resolve_existing_dir "$git_dir_raw")"; then
-					local trusted_layout=false
-					if [[ "$git_dir" == "$git_common_dir" ]]; then
-						trusted_layout=true
-					elif [[ "$git_dir" == "$git_common_dir"/worktrees/* ]]; then
-						trusted_layout=true
-					fi
+		for _cco_check_dir in "${_cco_check_dirs[@]}"; do
+			local git_common_dir_raw git_dir_raw git_common_dir git_dir
+			git_common_dir_raw="$(git -C "$_cco_check_dir" rev-parse --git-common-dir 2>/dev/null)" || true
+			git_dir_raw="$(git -C "$_cco_check_dir" rev-parse --git-dir 2>/dev/null)" || true
 
-					if [[ "$trusted_layout" == true || "$allow_external_git_dir" == true ]]; then
-						if [[ "$git_common_dir" != "$PWD"/.git ]] && ! path_in_array "$git_common_dir" "${additional_dirs[@]}"; then
-							additional_dirs+=("$git_common_dir")
-							git_worktree_common_dir="$git_common_dir"
-							log "Adding git common dir for worktree support: $git_common_dir"
+			if [[ -n "$git_common_dir_raw" && -n "$git_dir_raw" ]]; then
+				if git_common_dir="$(resolve_existing_dir "$git_common_dir_raw")"; then
+					if git_dir="$(resolve_existing_dir "$git_dir_raw")"; then
+						local trusted_layout=false
+						if [[ "$git_dir" == "$git_common_dir" ]]; then
+							trusted_layout=true
+						elif [[ "$git_dir" == "$git_common_dir"/worktrees/* ]]; then
+							trusted_layout=true
 						fi
-					else
-						warn "Skipping untrusted git common dir layout: $git_common_dir"
-						warn "Use --allow-external-git-dir (or CCO_ALLOW_EXTERNAL_GIT_DIR=1) to allow it"
+
+						if [[ "$trusted_layout" == true || "$allow_external_git_dir" == true ]]; then
+							if [[ "$git_common_dir" != "$PWD"/.git ]] && ! path_in_array "$git_common_dir" "${additional_dirs[@]}"; then
+								additional_dirs+=("$git_common_dir")
+								git_worktree_common_dir="$git_common_dir"
+								log "Adding git common dir for worktree support: $git_common_dir"
+							fi
+						else
+							warn "Skipping untrusted git common dir layout: $git_common_dir"
+							warn "Use --allow-external-git-dir (or CCO_ALLOW_EXTERNAL_GIT_DIR=1) to allow it"
+						fi
 					fi
-				else
-					warn "Skipping git common dir: unable to resolve git dir path: $git_dir_raw"
 				fi
-			else
-				warn "Skipping git common dir: unable to resolve path: $git_common_dir_raw"
 			fi
-		fi
+		done
 	elif [[ "$enable_git_worktree_common_dir" == false ]]; then
 		log "Git worktree common-dir auto-detection disabled by flag"
 	fi

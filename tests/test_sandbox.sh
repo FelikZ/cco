@@ -130,6 +130,33 @@ else
 	fail "-w flag allows writes to specified file"
 fi
 
+echo ""
+echo "--- HOME Write Restrictions ---"
+
+CLAUDE_HOME="$HOME/.sandbox_claude_home_$$"
+mkdir -p "$CLAUDE_HOME/existing-dir"
+echo "original" >"$CLAUDE_HOME/existing-dir/existing.txt"
+
+echo "Test: Arbitrary HOME sibling creation is blocked"
+if HOME="$CLAUDE_HOME" ./sandbox sh -c ': >"$HOME/.unexpected-home-write-$$"' 2>/dev/null; then
+	fail "Arbitrary HOME sibling creation is blocked"
+else
+	pass "Arbitrary HOME sibling creation is blocked"
+fi
+
+echo "Test: Existing HOME entries stay read-only"
+if HOME="$CLAUDE_HOME" ./sandbox sh -c 'echo changed >"$HOME/existing-dir/existing.txt"' 2>/dev/null; then
+	fail "Existing HOME entries stay read-only"
+else
+	if [[ "$(cat "$CLAUDE_HOME/existing-dir/existing.txt")" == "original" ]]; then
+		pass "Existing HOME entries stay read-only"
+	else
+		fail "Existing HOME entries stay read-only: content changed"
+	fi
+fi
+
+rm -rf "$CLAUDE_HOME"
+
 #
 # Read-only path tests
 #

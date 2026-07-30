@@ -33,7 +33,7 @@ Claude Code runs directly on the host system with full user privileges:
 `cco` addresses these vulnerabilities through strict containerization:
 
 ### Enforced Sandbox
-- **Scoped filesystem access**: Claude can read/write the current project directory plus Claude-specific config paths (`~/.claude`, detected config dir, `.claude.json`). In Docker mode no other host paths exist unless you mount them. In native mode both Seatbelt (macOS) and bubblewrap (Linux) expose the entire host filesystem as read-only by default; use `--safe` to hide your `$HOME` directory for better isolation.
+- **Scoped filesystem access**: Claude can read/write the current project directory plus Claude-specific config paths (`~/.claude`, detected config dir, `.claude.json`) and the transient Claude lock/temp paths needed by the CLI. Trusted git worktree metadata is also writable when auto-detected. In Docker mode no other host paths exist unless you mount them. In native mode both Seatbelt (macOS) and bubblewrap (Linux) expose the entire host filesystem as read-only by default; use `--safe` to hide your `$HOME` directory for better isolation.
 - **Directory changes are sandboxed**: `cd /` succeeds, but in Docker mode this is the container's root filesystem (not your host), and in native mode both Seatbelt and bubblewrap deny writes outside the whitelisted paths while still allowing reads of the entire host filesystem.
 - **Process isolation**: Claude's processes are contained within either the container namespace or the native sandbox profile, preventing host-level process injection.
 - **Enhanced safe mode** (experimental): `cco --safe` (native sandbox only) provides stronger filesystem isolation by hiding your `$HOME` directory entirely, leaving only the project directory and explicitly whitelisted paths visible for reads. This significantly reduces exposure compared to the default native sandbox behavior. **Trade-off**: Some tools may fail if they require access to configuration files in `$HOME` - use `--allow-readonly` to selectively expose needed paths.
@@ -52,10 +52,10 @@ Claude Code runs directly on the host system with full user privileges:
 ### Credential Protection
 - **Runtime extraction**: Each session fetches fresh Claude credentials (macOS Keychain or Linux config file) into a temporary location.
 - **Read/write reality**: Claude's config directories (`~/.claude`, detected config dir, `.claude.json`) are mounted read-write so it can persist preferences and session state.
-- **Credential file access**: The credentials JSON is mounted read-only by default, so Claude cannot update tokens unless `--allow-oauth-refresh` is explicitly enabled.
+- **Credential file access**: Docker uses a temporary credentials mount that is read-only by default and becomes read/write only with `--allow-oauth-refresh`. Native backends expose Claude's normal config paths for CLI compatibility, but `cco` treats backends that cannot safely persist an in-sandbox refresh as non-persisting. For those backends, expired OAuth credentials are repaired before startup and valid near-expiry credentials are refreshed by a background host-side helper.
 - **No image persistence**: Credentials are never baked into the Docker image; temporary files are cleaned up after the session.
-- **Startup recovery helpers**: Before sandbox startup, `cco` may offer two host-side recovery steps when credentials are unusable: `security unlock-keychain ...` for locked macOS login keychains over SSH, and a one-shot plain `claude -p ...` call to refresh expired OAuth credentials when the chosen sandbox cannot safely sync the refresh back.
-- **Consent boundary**: Those startup recovery helpers run only after an interactive confirmation, or automatically when `--yes` / `-y` is supplied. They are additive host-side actions, but they do not grant Claude ongoing general Keychain access or silently widen the sandbox after startup.
+- **Startup credential maintenance**: Before sandbox startup, `cco` may run a one-shot plain `claude -p ...` call on the host when stored OAuth credentials are already expired and the chosen sandbox cannot safely sync an in-sandbox refresh back. For valid credentials that expire within two hours, `cco` starts a lock-protected background host-side refresh and continues startup. It may also offer `security unlock-keychain ...` for locked macOS login keychains over SSH.
+- **Consent boundary**: Keychain unlock recovery still runs only after an interactive confirmation, or automatically when `--yes` / `-y` is supplied. OAuth maintenance is a fixed `cco`-controlled host action; it does not grant Claude ongoing general Keychain access or widen the sandbox after startup.
 
 ## Threat Model
 
@@ -142,11 +142,13 @@ Claude Code runs directly on the host system with full user privileges:
 | `~/.claude` | Read/write | Session state, MCP configs, logs |
 | Detected config directory (`$XDG_CONFIG_HOME/claude` or `~/.claude`) | Read/write | Needed for new Claude CLI defaults |
 | `~/.claude.json` | Read/write | CLI top-level state file |
+| Claude lock/temp paths | Limited write | macOS Seatbelt allows narrow `~/.claude.lock`, `~/.claude.json.lock`, and `~/.claude.json.tmp.*` writes; Linux native does not broadly open `$HOME` for arbitrary sibling creation |
+| Trusted git worktree common dir | Read/write | Auto-added when current directory or immediate child git checkout uses the standard `.git/worktrees/...` layout |
 | `~/.ssh` | Read-only | Exposed so git can use host keys; consider using ssh-agent instead |
 | `~/.gitconfig` | Read-only | Git identity and settings |
 | Temporary credential file | Read-only | Mounted at runtime; becomes read/write only with `--allow-oauth-refresh` |
 | macOS Keychain | No access | Becomes read/write with `--allow-keychain` (CRITICAL security risk) |
-| Other host paths | No access | Unless explicitly mounted via flags |
+| Other host paths | Read-only in native default; no access in Docker | Native `--safe` hides `$HOME` except explicitly shared paths |
 
 **Safe Mode (`--safe`, native only, experimental)**
 - **Provides stronger filesystem isolation**: Hides your entire `$HOME` directory from Claude, significantly reducing exposure of personal files, dotfiles, secrets, and caches.
@@ -161,7 +163,7 @@ Claude Code runs directly on the host system with full user privileges:
 - Use `--deny-path PATH` to hide a path entirely (appears empty/blocked inside the sandbox). In Docker/bubblewrap this is implemented with empty overlays; in Seatbelt it raises access errors.
 - `--add-dir PATH[:ro|:rw]` lets you control permissions inline when mounting additional content.
 - Claude Code's local `.claude/settings.local.json` can also contribute read/write mounts through its `additionalDirectories` array. `cco` treats those entries like local `--add-dir PATH:rw` rules and warns if the file exists but cannot be parsed.
-- Git worktree support auto-detects `git rev-parse --git-common-dir` only for trusted git layouts. Use `--disable-git-worktree-common-dir` if you want fully manual control and no auto-added git paths.
+- Git worktree support auto-detects `git rev-parse --git-common-dir` from the current directory and immediate child git checkouts, but only auto-allows trusted git layouts. Use `--disable-git-worktree-common-dir` if you want fully manual control and no auto-added git paths.
 
 ## Terminal Injection Attacks (Linux)
 
@@ -248,21 +250,23 @@ When enabled (Docker backend only), `cco`:
 - Preserves container credentials for manual recovery if sync-back fails
 - Only enables when explicitly requested via `--allow-oauth-refresh`
 
-### Startup Recovery Prompts (`--yes`)
-**Purpose**: Lets `cco` auto-accept startup recovery prompts such as unlocking the macOS login keychain over SSH or running a one-shot plain Claude OAuth refresh before entering the sandbox.
+### Startup Credential Maintenance
+**Purpose**: Lets `cco` keep Claude credentials usable without giving sandboxed Claude broader write access. When stored OAuth credentials are already expired and the selected backend cannot safely persist an in-sandbox refresh, `cco` runs one fixed plain-Claude refresh on the host before startup and verifies the credentials were repaired. When credentials are valid but expire within two hours, `cco` starts a lock-protected background host-side refresh and lets startup continue. `--yes` still only controls interactive recovery prompts such as unlocking the macOS login keychain over SSH.
 
 **Security Implications**:
-- **Host-side command execution before sandboxing**: `cco` may run `security unlock-keychain ...` or a plain `claude -p ...` command on the host before the sandbox starts.
-- **Removes an interactive confirmation step**: `--yes` does not add new capabilities by itself, but it does make those recovery actions happen automatically when the preflight detects the relevant failure mode.
+- **Host-side command execution around startup**: `cco` may run `security unlock-keychain ...` or a plain `claude -p ...` command on the host before the sandbox starts. The near-expiry OAuth helper can continue in the background after startup begins.
+- **Automatic OAuth maintenance**: The plain-Claude refresh can run without a prompt when credentials are expired or close to expiry, so startup does not depend on granting sandboxed Claude home-directory or credential write access.
+- **Prompt auto-acceptance**: `--yes` does not add new capabilities by itself, but it does make prompt-based recovery actions happen automatically when the preflight detects the relevant failure mode.
 - **Plain-Claude refresh is outside `cco` isolation**: The OAuth recovery helper intentionally runs outside the sandbox so refreshed credentials can land back in the host's normal Claude auth store.
 
 **What this does NOT do**:
 - It does **not** grant Claude unrestricted Keychain access during the session. That still requires `--allow-keychain`, which is a much higher-risk mode.
-- It does **not** make host-side recovery actions available unless the preflight detects a locked keychain or an OAuth refresh problem.
+- It does **not** make host-side recovery actions available unless the preflight detects a locked keychain, expired OAuth credentials, or OAuth credentials that expire within two hours.
+- It does **not** make real `$HOME` broadly writable in native Linux sandbox mode.
 
 **Recommendation**:
 - Treat `--yes` as a convenience flag for trusted, unattended startup only.
-- Prefer the default interactive confirmation if you want a deliberate checkpoint before any host-side recovery action runs.
+- Prefer the default interactive confirmation if you want a deliberate checkpoint before prompt-based host recovery actions run.
 
 ### Keychain Access (`--allow-keychain`)
 **Purpose**: Allows Claude to access macOS Keychain for OAuth token refresh in seatbelt sandbox mode.

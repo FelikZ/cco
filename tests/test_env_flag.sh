@@ -114,6 +114,19 @@ else
 	fail ".env file skips comments and blank lines: got '$output'"
 fi
 
+echo "Test: .env file skips indented comments"
+cat >"$TEST_DIR/.env" <<'EOF'
+FIRST_VAR=one
+ # Indented comment
+SECOND_VAR=two
+EOF
+# shellcheck disable=SC2016
+if output=$(cd "$TEST_DIR" && "$OLDPWD/cco" shell 'echo ${FIRST_VAR}_${SECOND_VAR}') && [[ "$output" == "one_two" ]]; then
+	pass ".env file skips indented comments"
+else
+	fail ".env file skips indented comments: got '$output'"
+fi
+
 echo "Test: -e flag takes precedence over .env file"
 echo 'OVERRIDE_VAR=from_dotenv' >"$TEST_DIR/.env"
 # shellcheck disable=SC2016

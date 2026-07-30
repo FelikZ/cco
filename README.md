@@ -62,7 +62,7 @@ You should barely notice `cco` is there, except for that reassuring feeling of s
 - **Automatic sandbox selection**: Chooses native OS sandboxing when available, Docker as fallback
 - **Native sandbox (preferred)**: Lightweight, fast startup, direct Keychain access on macOS. Exposes host filesystem read-only by default.
 - **Docker sandbox (fallback)**: Stronger filesystem isolation with container-only filesystem when native tools unavailable
-- **Host file access**: Your project files are accessible so Claude can read and edit them
+- **Host file access**: Your project files and Claude state paths are accessible so Claude can read and edit what it needs
 - **Git worktree support**: Automatically detects git worktrees and whitelists the main repo's `.git` directory so git operations work seamlessly
 - **Network access**: Full host network access for localhost development servers, MCP servers, and web requests
 - **Credential management**: Authentication is handled securely without exposing host credentials
@@ -184,6 +184,9 @@ cco --backend auto    # Auto-detect (default)
 # Rebuild the protective layer (Docker mode only, also updates to latest Claude Code version)
 cco --rebuild
 
+# Pull the latest pre-built image and automatically remove older cco image tags
+cco --pull --clean-old-images
+
 # System information and status
 cco --info
 
@@ -236,8 +239,9 @@ cco --deny-path ~/Downloads
 
 - `--docker-socket` (experimental): Binds the host Docker socket into the sandbox so Claude can control Docker on your machine. This defeats the isolation barrier—avoid unless you explicitly need host Docker access.
 - `--image IMAGE` / `--docker-image IMAGE` (Docker only): Runs `cco` against a specific Docker image instead of the default managed `cco:latest` image. This is useful if you `docker commit` a known-good persistent container yourself and want later `cco` runs to start from that image. With `--pull`, `cco` pulls the chosen image first.
+- `--clean-old-images` (Docker only): After a successful pre-built image pull, remove older `ghcr.io/nikvdp/cco:*` tags automatically. Without this flag, `cco` asks before removing old managed image tags when it can prompt.
 - `--force-docker-bridge-network` (Docker only): Force bridge networking instead of host networking. By default cco uses `--network=host` when available (Linux, OrbStack). Use this if you need port isolation or want explicit `-p` port forwarding.
-- `--yes` / `-y`: Auto-accept startup recovery prompts such as OAuth refresh or macOS Keychain unlock before `cco` starts.
+- `--yes` / `-y`: Auto-accept startup recovery prompts such as macOS Keychain unlock before `cco` starts. OAuth maintenance is automatic when needed and is not controlled by `--yes`.
 - `--allow-oauth-refresh` (experimental): Gives the container write access to your Claude credentials so refreshed tokens sync back to the host. Malicious prompts could corrupt or replace those credentials.
 - `--persist` (Docker only, opt-in): Reuses the default persistent container for the current repo instead of starting fresh each run. `cco` starts it for the invocation and stops it again when the run ends.
 - `--persist=NAME` or `--persist NAME`: Selects a specific persistent session for the current repo so you can keep multiple reusable container filesystems side by side.
@@ -316,10 +320,13 @@ DATABASE_URL=postgres://localhost/mydb
 cco --resume
 cco --model claude-3-5-sonnet-20241022 "write tests"
 cco --no-clipboard "analyze this file"
+cco --permission-mode auto "work through this task"
 
 # Mix cco and Claude options
 cco --env DEBUG=1 --resume  # `cco` + Claude options
 ```
+
+When you pass a Claude permission mode directly, `cco` leaves it alone instead of adding its default bypass flag. If your trusted Claude settings set `permissions.defaultMode` to `auto` and Auto Mode is not disabled, `cco` also lets that default apply.
 
 ### Run Arbitrary Commands (`--command`)
 
@@ -371,6 +378,21 @@ cco --add-dir ~/.codex --command "codex --dangerously-bypass-approvals-and-sandb
 
 Security note: `--dangerously-bypass-approvals-and-sandbox` applies to Codex’s internal permission checks, not to `cco`. The `cco` sandbox still constrains filesystem access to your project and explicitly mounted paths. Network access remains unrestricted by design.
 
+### Auto Mode (`cco auto <agent>`)
+
+`cco auto <agent>` runs an agent in its native "ask me when it matters" mode instead of the default full-bypass mode:
+
+- `cco auto claude` runs Claude with `--permission-mode auto` instead of `--dangerously-skip-permissions`.
+- `cco auto codex` runs Codex with `--ask-for-approval on-request` instead of `--dangerously-bypass-approvals-and-sandbox`; because it no longer uses the bypass flag, Codex's own sandbox may also apply.
+- For all other agents (`gemini`, `droid`, `opencode`, `pi`) it behaves exactly like running the agent normally.
+
+In every case `cco`'s sandbox still applies. For Claude, auto mode only changes Claude's permission posture; for Codex, replacing the bypass flag also lets Codex enforce its own sandbox unless your Codex configuration or arguments say otherwise.
+
+```bash
+cco auto claude "refactor this module"
+cco auto codex "build and run the tests"
+```
+
 ## MCP Server Support
 
 `cco` uses host-based networking so that MCP (Model Context Protocol) servers or other tools you may have running on localhost are accessible to `cco`.
@@ -415,6 +437,7 @@ cd cco
 ### Environment setup
 `cco` passes through everything you need:
 - `ANTHROPIC_API_KEY` - Direct access
+- `CLAUDE_CODE_OAUTH_TOKEN` - Externally managed Claude OAuth token; skips local credential checks and startup refresh
 - Terminal settings (`TERM`, `NO_COLOR`)
 - Git configuration
 - Locale and timezone
@@ -426,6 +449,7 @@ cd cco
 echo "DEBUG=1" > .env
 cco
 ```
+Blank lines, comments, whitespace-prefixed comments, and non-assignment lines in `.env` are ignored so shell-style formatting does not break startup.
 
 ## Requirements
 
@@ -443,7 +467,7 @@ cco
 - **Docker sandbox mode**:
   - **macOS**: Extracts from Keychain and mounts securely
   - **Linux**: Mounts `~/.claude/.credentials.json` or config directory
-- **Environment**: `ANTHROPIC_API_KEY` passed through in both modes
+- **Environment**: `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` passed through in both modes
 
 ## Architecture
 
@@ -458,7 +482,7 @@ Understanding the filesystem isolation differences between sandbox modes:
 | **Native + `--safe`** | Only project + whitelisted | **Strong** | Fast startup | Security + performance balance (experimental) |
 
 **Key Points:**
-- **Native sandbox (default)**: Exposes your entire host filesystem as read-only. Claude can read any file your user can read, but can only write to the project directory.
+- **Native sandbox (default)**: Exposes your entire host filesystem as read-only. Claude can read any file your user can read, but can only write to the project directory, Claude config/state paths, explicitly shared paths, and trusted git worktree metadata when needed.
 - **Docker sandbox**: Only shows explicitly mounted paths. Claude cannot see or read files outside mounted directories.
 - **`--safe` flag** (experimental): Available only with native sandboxing. Hides your `$HOME` directory entirely while keeping fast native performance. May cause some tools to fail if they require access to dotfiles or configuration in `$HOME`.
 
@@ -481,9 +505,9 @@ Understanding the filesystem isolation differences between sandbox modes:
 ### Safety features
 - **Filesystem isolation**: Level depends on sandbox mode
   - **Docker mode**: Only project and explicitly mounted paths visible
-  - **Native mode (default)**: Entire host filesystem visible read-only, project read/write
+  - **Native mode (default)**: Entire host filesystem visible read-only; project, Claude config/state paths, explicitly shared paths, and trusted git worktree metadata are read/write
   - **Native + `--safe`**: Only project and whitelisted paths visible (stronger isolation)
-- **Write protection**: All modes prevent writes outside project directory
+- **Write protection**: All modes prevent writes outside project, Claude state, and explicitly whitelisted paths
 - **Secure credential mounting**: Runtime-only credential access
 - **Fresh session isolation**: Clean environment for each session
 - **Terminal injection protection**: Linux sandbox blocks TIOCSTI/TIOCLINUX attacks via seccomp filtering
@@ -509,8 +533,8 @@ cco "review this pull request"
 ⚠️ **These features are experimental and may have edge cases. Use with caution.**
 
 ```bash
-# OAuth token refresh (EXPERIMENTAL)
-# Allows Claude to refresh expired tokens and sync back to host system
+# OAuth token sync-back (EXPERIMENTAL)
+# Lets sandboxed Claude sync refreshed credentials back to the host
 cco --allow-oauth-refresh "help me code"
 
 # Credential management (EXPERIMENTAL)  
@@ -520,7 +544,7 @@ cco restore-creds                   # Restore from most recent backup
 cco restore-creds backup-file.json  # Restore from specific backup
 ```
 
-**OAuth refresh feature**: Enables bidirectional credential sync when Claude refreshes expired tokens. Uses race condition protection and creates automatic backups.
+**OAuth refresh feature**: When the selected backend cannot safely persist an in-sandbox refresh, `cco` repairs already-expired Claude OAuth credentials with a fixed host-side Claude call before startup. If stored credentials are still valid but expire within two hours, `cco` starts Claude normally and runs the host-side refresh in the background. The experimental `--allow-oauth-refresh` mode is different: it enables bidirectional credential sync when sandboxed Claude refreshes expired tokens. It uses race condition protection and creates automatic backups.
 
 **Credential management**: Provides manual backup/restore of Claude Code credentials with cross-platform support (macOS Keychain + Linux files).
 
@@ -532,10 +556,10 @@ cco restore-creds backup-file.json  # Restore from specific backup
 - On macOS over SSH, `cco` will offer to unlock your login keychain if it cannot read Claude credentials. Use `--yes` to auto-accept that recovery step.
 
 **Token expiration**
-- If you get authentication errors, your OAuth token may have expired
-- The containerized environment prevents automatic token refresh by default
-- **Solution**: Run `claude` directly (outside `cco`) to re-authenticate, then retry with `cco`
-- For automatic token refresh, the beta `--allow-oauth-refresh` flag will sync container credentials back to your host. Only use it if you accept the additional credential tampering risk.
+- If you get authentication errors, your OAuth token may have expired or need a fresh browser login
+- `cco` checks stored OAuth expiry before sandbox startup. When the selected backend cannot safely persist an in-sandbox refresh, already-expired credentials are repaired before Claude starts. Valid credentials that expire within two hours are refreshed in the background while startup continues.
+- **Fallback**: Run `claude` directly (outside `cco`) to re-authenticate, then retry with `cco`
+- For in-sandbox refresh sync-back, the beta `--allow-oauth-refresh` flag will sync container credentials back to your host. Only use it if you accept the additional credential tampering risk.
 
 **Docker problems**
 - Start Docker daemon
@@ -547,15 +571,15 @@ cco restore-creds backup-file.json  # Restore from specific backup
 
 **Experimental features not working**
 - OAuth refresh (`--allow-oauth-refresh`) is beta, reduces credential isolation, and may have issues
-- Fallback: authenticate directly with `claude` when tokens expire
+- Fallback: authenticate directly with `claude` if the startup refresh cannot recover credentials
 - Use credential backup/restore commands for safety: `cco backup-creds` / `cco restore-creds`
 
 ### Known Issues
 
-**Token expires during active session (macOS)**
-If Claude stops responding with API errors during an active `cco` session, your OAuth token has likely expired mid-session. This is primarily a macOS issue due to credential storage differences.
+**Token expires during active session**
+If Claude stops responding with API errors during an active `cco` session, your OAuth token has likely expired mid-session. `cco` normally refreshes valid tokens that expire within two hours in the background during startup, but a long-running session can still cross the expiry boundary.
 
-**Root cause**: When Claude Code runs inside the Linux container, it cannot directly update the macOS Keychain on the host system where credentials are stored. The OAuth refresh call is "coming from inside the house" but can't reach the host Keychain.
+**Root cause**: Some sandbox backends cannot safely persist Claude's refreshed OAuth credentials back to the host credential store without granting broader credential or home-directory write access. `cco` keeps the sandbox narrow, repairs already-expired credentials before startup, and performs background host-side refresh for valid credentials that are close to expiry.
 
 **Workaround**:
 1. Open a new terminal window
@@ -565,9 +589,7 @@ If Claude stops responding with API errors during an active `cco` session, your 
 5. Quit your current `cco` session
 6. Restart with `cco --resume` to pick up the refreshed credentials
 
-**Linux note**: This issue may not affect Linux systems where credentials are file-based and can potentially be updated with `--allow-oauth-refresh` flag, though this needs more testing.
-
-*PRs welcome to investigate cross-platform solutions for seamless credential refresh.*
+For repeated startup failures, run plain `claude` once to confirm the account can refresh or re-login outside the sandbox, then start `cco` again.
 
 **Stdio-based MCP servers not available**
 If Claude reports that stdio-based MCP servers are not found or not working, they need to be installed inside the container. See [MCP Server Support](#mcp-server-support) section for installation instructions.
